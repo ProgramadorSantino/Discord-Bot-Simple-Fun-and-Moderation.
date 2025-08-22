@@ -4,7 +4,7 @@ import random
 import discord
 from discord.ext import commands
 from logic import gen_pass, eight_ball, coin_flip, roll_dice
-from dotenv import load_dotenv  # add this import (below your other imports)
+from dotenv import load_dotenv 
 # Custom emojis
 VICTORY = "<:VICTORY:1408236937424273529>"
 
@@ -165,4 +165,5 @@ async def on_command_error(ctx: commands.Context, error):
 if TOKEN == "REPLACE_ME_WITH_ENV_VAR":
     raise SystemExit("Set DISCORD_TOKEN env var instead of hardcoding your token.")
 bot.run(TOKEN)
+
 
