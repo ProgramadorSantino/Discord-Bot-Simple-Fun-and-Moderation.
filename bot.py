@@ -19,7 +19,7 @@ log = logging.getLogger("julian-bot")
 
 # ---------- Custom emojis ----------
 VICTORY = "<:VICTORY:1408236937424273529>"
-
+RUN = "<a:RUN:1408589572312535121>"
 # number emoji list for polls: supports up to 10 options
 NUM_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 
@@ -226,11 +226,11 @@ async def hello(ctx: commands.Context):
 
 @bot.command(name="FUCKYOU")
 async def insult(ctx: commands.Context):
-    await ctx.send(f"No u {VICTORY}<a:RUN:1408589572312535121>")
+    await ctx.send(f"No u {VICTORY} {RUN}")
 
 @bot.command(name="bye")
 async def bye(ctx: commands.Context):
-    await ctx.send(f"Ok fine, dramatic exit in 3…2…1… <a:RUN:1408589572312535121> {VICTORY} {VICTORY} {VICTORY}")
+    await ctx.send(f"Ok fine, dramatic exit in 3…2…1…  {RUN} {VICTORY} {VICTORY} {VICTORY}")
 
 @bot.command(name="pass")
 @commands.cooldown(2, 5, commands.BucketType.user)
@@ -240,12 +240,12 @@ async def password(ctx: commands.Context, length: int = 10):
 @bot.command(name="8ball")
 @commands.cooldown(2, 5, commands.BucketType.user)
 async def eightball_cmd(ctx: commands.Context, *, question: str = ""):
-    await ctx.send(f"🎱 {eight_ball()} {VICTORY} <a:RUN:1408589572312535121>")
+    await ctx.send(f"🎱 {eight_ball()} {VICTORY} {RUN}")
 
 @bot.command(name="flip")
 @commands.cooldown(2, 5, commands.BucketType.user)
 async def flip(ctx: commands.Context):
-    await ctx.send(f"🪙 {coin_flip()}! {VICTORY} <a:RUN:1408589572312535121>")
+    await ctx.send(f"🪙 {coin_flip()}! {VICTORY} {RUN}")
 
 @bot.command(name="roll")
 @commands.cooldown(2, 5, commands.BucketType.user)
@@ -356,7 +356,7 @@ async def remindme(ctx: commands.Context, time: str, *, message: str):
 async def dadjoke(ctx: commands.Context):
     jokes = [
         "I would tell you a construction joke, but I’m still working on it.",
-        "Why did the scarecrow get promoted? He was outstanding in his field.",
+        "Why did the scarecrow get promoted? He was outstanding in his field. {RUN}",
         "I used to hate facial hair… but then it grew on me.",
         "Why don’t eggs tell jokes? They’d crack each other up.",
     ]
@@ -634,13 +634,3 @@ if TOKEN == "REPLACE_ME_WITH_ENV_VAR":
     raise SystemExit("Set DISCORD_TOKEN env var instead of hardcoding your token.")
 
 bot.run(TOKEN)
-
-
-
-
-
-
-
-
-
-
