@@ -1,7 +1,11 @@
 # bot.py
 import os
+import re
 import random
 import logging
+import asyncio
+from datetime import datetime, timedelta, timezone
+
 import discord
 from discord.ext import commands
 from discord.ext.commands import BadArgument
@@ -15,6 +19,16 @@ log = logging.getLogger("julian-bot")
 
 # ---------- Custom emojis ----------
 VICTORY = "<:VICTORY:1408236937424273529>"
+
+# number emoji list for polls: supports up to 10 options
+NUM_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+# ---------- Simple in-memory stores ----------
+# warnings[(guild_id, user_id)] = list of dicts: {'reason': str, 'by': int, 'at': datetime}
+warnings_store = {}
+
+# track scheduled unmutes so we don't duplicate (optional convenience)
+scheduled_unmutes = {}  # key: (guild_id, user_id) -> asyncio.Task
 
 # ---------- Env ----------
 load_dotenv()
@@ -53,6 +67,80 @@ async def _ensure_guild(ctx: commands.Context):
         await ctx.send("This command only works in servers.")
         return False
     return True
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def parse_duration_to_seconds(text: str) -> int:
+    """
+    Parse duration strings like '15m', '2h', '1h30m', '3d', '1w2d', '45s'
+    Returns total seconds (int). Raises ValueError if invalid.
+    """
+    text = text.strip().lower().replace(" ", "")
+    if not text:
+        raise ValueError("empty duration")
+
+    pattern = r"(\d+)([smhdw])"
+    units = {"s":1, "m":60, "h":3600, "d":86400, "w":604800}
+    total = 0
+    for amount, unit in re.findall(pattern, text):
+        total += int(amount) * units[unit]
+    if total == 0:
+        raise ValueError("invalid duration")
+    return total
+
+async def ensure_muted_role(guild: discord.Guild) -> discord.Role:
+    """
+    Get or create a 'Muted' role with safe channel overwrites.
+    """
+    role = discord.utils.get(guild.roles, name="Muted")
+    if role:
+        return role
+
+    # Create role with no special perms; channel overwrites will do the heavy lifting
+    role = await guild.create_role(name="Muted", reason="Auto-created for mute command")
+    # Apply channel overwrites
+    overwrite = discord.PermissionOverwrite(send_messages=False, add_reactions=False, speak=False, connect=False)
+    for channel in guild.channels:
+        try:
+            await channel.set_permissions(role, overwrite=overwrite)
+        except Exception:
+            # Some channels may error (e.g., lack perms); skip quietly
+            pass
+    return role
+
+async def schedule_unmute(guild_id: int, user_id: int, seconds: int, reason: str = "Timed mute expired"):
+    """
+    Background scheduler to unmute after N seconds.
+    """
+    key = (guild_id, user_id)
+    # cancel existing if any
+    old = scheduled_unmutes.get(key)
+    if old and not old.done():
+        old.cancel()
+
+    async def _task():
+        try:
+            await asyncio.sleep(seconds)
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                return
+            member = guild.get_member(user_id)
+            if not member:
+                return
+            role = discord.utils.get(guild.roles, name="Muted")
+            if role and role in member.roles:
+                await member.remove_roles(role, reason=reason)
+                channel = guild.system_channel or discord.utils.get(guild.text_channels)
+                if channel:
+                    await channel.send(f"🔈 Auto-unmuted {member.mention} — mute expired. {VICTORY}")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            scheduled_unmutes.pop(key, None)
+
+    t = asyncio.create_task(_task())
+    scheduled_unmutes[key] = t
 
 # ---------- Events ----------
 @bot.event
@@ -103,16 +191,27 @@ async def _help(ctx: commands.Context):
         "• `roll [NdM]` → roll dice, e.g. `2d6`",
         "• `say <text>` → I repeat (pings disabled)",
         "• `ping` → latency",
+        "• `avatar [@user]` → show profile pic",
+        "• `userinfo [@user]` → basic user info",
+        "• `serverinfo` → server stats",
+        "• `choose option1 | option2 | ...` → I pick one",
+        "• `poll \"Question\" opt1 | opt2 | ...` → reaction poll (up to 10)",
+        "• `remindme <time> <message>` → DM reminder, e.g., `remindme 15m drink water`",
+        "• `dadjoke` → so bad it’s good 😅",
     ]
     if is_admin:
         lines += [
             "",
-            "__Admin only__",
-            "• `kick @user [reason]`",
-            "• `ban @user [reason]`",
+            "__Admin/Mod only__",
+            "• `kick @user [reason]` / `ban @user [reason]`",
             "• `purge <count>` (1–100)",
             "• `giverole @user <role>` / `removerole @user <role>`",
             "• `joined <member>`",
+            "• `warn @user [reason]` / `warnings @user` / `clearwarnings @user`",
+            "• `slowmode <seconds>`",
+            "• `lockdown [reason]` / `unlock` (current channel)",
+            "• `nickname @user <new name>`",
+            "• `mute @user [time]` / `unmute @user` (creates Muted role if missing)",
         ]
     lines += [
         "",
@@ -169,6 +268,100 @@ async def say(ctx: commands.Context, *, text: str):
 async def ping(ctx: commands.Context):
     await ctx.send(f"Pong! {round(bot.latency*1000)} ms")
 
+# ---------- Member Utilities ----------
+@bot.command(name="avatar")
+async def avatar(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    await ctx.send(member.display_avatar.url if member.display_avatar else "No avatar.")
+
+@bot.command(name="userinfo")
+async def userinfo(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    created = discord.utils.format_dt(member.created_at, style="F")
+    joined = discord.utils.format_dt(member.joined_at, style="F") if member.joined_at else "Unknown"
+    embed = discord.Embed(title=f"User Info — {member}", color=0x00ccff)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ID", value=member.id, inline=True)
+    embed.add_field(name="Top Role", value=member.top_role.mention if member.top_role else "None", inline=True)
+    embed.add_field(name="Account Created", value=created, inline=False)
+    embed.add_field(name="Joined Server", value=joined, inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command(name="serverinfo")
+async def serverinfo(ctx: commands.Context):
+    if not await _ensure_guild(ctx):
+        return
+    guild = ctx.guild
+    embed = discord.Embed(title=f"{guild.name} — Server Info", color=0x00ffcc)
+    embed.set_thumbnail(url=guild.icon.url if guild.icon else discord.Embed.Empty)
+    embed.add_field(name="Owner", value=str(guild.owner), inline=False)
+    embed.add_field(name="Members", value=guild.member_count, inline=True)
+    embed.add_field(name="Boost Level", value=guild.premium_tier, inline=True)
+    embed.add_field(name="Created", value=discord.utils.format_dt(guild.created_at, style="F"), inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command(name="choose")
+async def choose(ctx: commands.Context, *, options: str):
+    """
+    Choose one from 'option1 | option2 | option3'
+    """
+    parts = [p.strip() for p in options.split("|") if p.strip()]
+    if len(parts) < 2:
+        return await ctx.send("Give me at least two options, like: `$choose tacos | sushi | pizza`")
+    pick = random.choice(parts)
+    await ctx.send(f"I choose: **{pick}** {VICTORY}")
+
+@bot.command(name="poll")
+async def poll(ctx: commands.Context, *, text: str):
+    """
+    Usage: $poll "Your question?" opt1 | opt2 | opt3
+    """
+    m = re.match(r'"\s*(.+?)\s*"\s*(.+)', text)
+    if not m:
+        return await ctx.send('Format: `$poll "Question" option1 | option2 | option3`')
+    question, options = m.groups()
+    opts = [o.strip() for o in options.split("|") if o.strip()]
+    if not (2 <= len(opts) <= 10):
+        return await ctx.send("Give me between 2 and 10 options, separated by `|`.")
+    # build embed
+    desc = "\n".join(f"{NUM_EMOJIS[i]}  {opt}" for i, opt in enumerate(opts))
+    embed = discord.Embed(title=f"📊 {question}", description=desc, color=0x7289DA)
+    embed.set_footer(text=f"Requested by {ctx.author}")
+    msg = await ctx.send(embed=embed)
+    for i in range(len(opts)):
+        try:
+            await msg.add_reaction(NUM_EMOJIS[i])
+        except Exception:
+            pass
+
+@bot.command(name="remindme")
+async def remindme(ctx: commands.Context, time: str, *, message: str):
+    """
+    $remindme 10m drink water
+    """
+    try:
+        seconds = parse_duration_to_seconds(time)
+    except ValueError:
+        return await ctx.send("Time format invalid. Try like `10m`, `2h30m`, `3d`.")
+    await ctx.send(f"⏰ Reminder set for {time}: **{message}** {VICTORY}")
+    async def _remind():
+        await asyncio.sleep(seconds)
+        try:
+            await ctx.author.send(f"⏰ Reminder from **{ctx.guild.name if ctx.guild else 'DM'}**: {message}")
+        except discord.Forbidden:
+            await ctx.send(f"{ctx.author.mention} ⏰ Reminder: {message}")
+    asyncio.create_task(_remind())
+
+@bot.command(name="dadjoke")
+async def dadjoke(ctx: commands.Context):
+    jokes = [
+        "I would tell you a construction joke, but I’m still working on it.",
+        "Why did the scarecrow get promoted? He was outstanding in his field.",
+        "I used to hate facial hair… but then it grew on me.",
+        "Why don’t eggs tell jokes? They’d crack each other up.",
+    ]
+    await ctx.send(random.choice(jokes) + f" {VICTORY}")
+
 # ---------- Moderation ----------
 @bot.command(name="kick")
 @commands.has_permissions(kick_members=True)
@@ -216,7 +409,6 @@ async def purge(ctx: commands.Context, count: int):
     deleted = await ctx.channel.purge(limit=count + 1)  # +1 includes the command message
     await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.", delete_after=3)
 
-# ---------- Role Management ----------
 @bot.command(name="giverole")
 @commands.has_permissions(manage_roles=True)
 async def giverole(ctx: commands.Context, member: discord.Member, *, role_name: str):
@@ -253,13 +445,11 @@ async def removerole(ctx: commands.Context, member: discord.Member, *, role_name
     except Exception as e:
         await ctx.send(f"⚠️ Couldn’t remove role: `{e}`")
 
-# ---------- Admin: Joined Info ----------
 @bot.command(name="joined")
 @commands.has_permissions(administrator=True)
 async def joined(ctx: commands.Context, *, member: discord.Member):
     if not await _ensure_guild(ctx):
         return
-
     joined_at = member.joined_at
     if joined_at:
         joined_abs = discord.utils.format_dt(joined_at, style="F")
@@ -267,7 +457,6 @@ async def joined(ctx: commands.Context, *, member: discord.Member):
     else:
         joined_abs = "Unknown"
         joined_rel = ""
-
     roles = [r for r in member.roles if r != ctx.guild.default_role]
     if roles:
         top = member.top_role if member.top_role != ctx.guild.default_role else None
@@ -275,11 +464,149 @@ async def joined(ctx: commands.Context, *, member: discord.Member):
         role_line = ", ".join([top.mention] + [r.mention for r in other]) if top else ", ".join(r.mention for r in other)
     else:
         role_line = "No roles"
-
     await ctx.send(
         f"**{member}** joined {joined_abs} ({joined_rel})\n"
         f"**Roles:** {role_line}"
     )
+
+# ---- New: Warnings system ----
+@bot.command(name="warn")
+@commands.has_permissions(manage_messages=True)
+async def warn(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    if not await _ensure_guild(ctx):
+        return
+    if not _can_act(ctx.author, member):
+        return await ctx.send("You can’t warn that member due to role hierarchy.")
+    key = (ctx.guild.id, member.id)
+    warnings_store.setdefault(key, []).append({"reason": reason, "by": ctx.author.id, "at": _now_utc()})
+    try:
+        await member.send(f"⚠️ You’ve been warned in **{ctx.guild.name}**: {reason}")
+    except discord.Forbidden:
+        pass
+    await ctx.send(f"⚠️ Warned {member.mention} — {reason}")
+
+@bot.command(name="warnings")
+@commands.has_permissions(manage_messages=True)
+async def warnings_cmd(ctx: commands.Context, member: discord.Member):
+    if not await _ensure_guild(ctx):
+        return
+    key = (ctx.guild.id, member.id)
+    entries = warnings_store.get(key, [])
+    if not entries:
+        return await ctx.send(f"{member.mention} has no warnings. {VICTORY}")
+    lines = [f"Warnings for **{member}**:"]
+    for i, w in enumerate(entries, 1):
+        when = discord.utils.format_dt(w["at"], style="R")
+        mod = ctx.guild.get_member(w["by"])
+        lines.append(f"{i}. {w['reason']} — by {mod.mention if mod else w['by']} ({when})")
+    await ctx.send("\n".join(lines))
+
+@bot.command(name="clearwarnings")
+@commands.has_permissions(manage_messages=True)
+async def clearwarnings(ctx: commands.Context, member: discord.Member):
+    if not await _ensure_guild(ctx):
+        return
+    key = (ctx.guild.id, member.id)
+    count = len(warnings_store.get(key, []))
+    warnings_store.pop(key, None)
+    await ctx.send(f"🧽 Cleared **{count}** warnings for {member.mention}.")
+
+# ---- New: slowmode / lockdown / unlock / nickname / mute / unmute ----
+@bot.command(name="slowmode")
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx: commands.Context, seconds: int):
+    if not await _ensure_guild(ctx):
+        return
+    seconds = max(0, min(seconds, 21600))  # 6 hours cap
+    await ctx.channel.edit(slowmode_delay=seconds, reason=f"By {ctx.author}")
+    if seconds == 0:
+        await ctx.send("⏱️ Slowmode disabled for this channel.")
+    else:
+        await ctx.send(f"⏱️ Slowmode set to **{seconds}s**.")
+
+@bot.command(name="lockdown")
+@commands.has_permissions(manage_channels=True)
+async def lockdown(ctx: commands.Context, *, reason: str = "Lockdown"):
+    if not await _ensure_guild(ctx):
+        return
+    everyone = ctx.guild.default_role
+    overwrites = ctx.channel.overwrites_for(everyone)
+    overwrites.send_messages = False
+    try:
+        await ctx.channel.set_permissions(everyone, overwrite=overwrites, reason=f"{reason} — by {ctx.author}")
+        await ctx.send(f"🔒 Channel locked. Reason: {reason}")
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to lock this channel.")
+
+@bot.command(name="unlock")
+@commands.has_permissions(manage_channels=True)
+async def unlock(ctx: commands.Context):
+    if not await _ensure_guild(ctx):
+        return
+    everyone = ctx.guild.default_role
+    overwrites = ctx.channel.overwrites_for(everyone)
+    overwrites.send_messages = None  # reset to default
+    try:
+        await ctx.channel.set_permissions(everyone, overwrite=overwrites, reason=f"Unlock by {ctx.author}")
+        await ctx.send("🔓 Channel unlocked.")
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to unlock this channel.")
+
+@bot.command(name="nickname")
+@commands.has_permissions(manage_nicknames=True)
+async def nickname(ctx: commands.Context, member: discord.Member, *, new_name: str):
+    if not await _ensure_guild(ctx):
+        return
+    if not _can_act(ctx.author, member):
+        return await ctx.send("You can’t change that member’s nickname due to role hierarchy.")
+    try:
+        await member.edit(nick=new_name, reason=f"By {ctx.author}")
+        await ctx.send(f"✏️ Nickname changed for {member.mention} → **{new_name}**")
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to change that nickname.")
+
+@bot.command(name="mute")
+@commands.has_permissions(moderate_members=True, manage_roles=True)
+async def mute(ctx: commands.Context, member: discord.Member, duration: str = None, *, reason: str = "Muted"):
+    if not await _ensure_guild(ctx):
+        return
+    if not _can_act(ctx.author, member):
+        return await ctx.send("You can’t mute that member due to role hierarchy.")
+    role = await ensure_muted_role(ctx.guild)
+    if role in member.roles:
+        return await ctx.send("They’re already muted.")
+    try:
+        await member.add_roles(role, reason=f"{reason} — by {ctx.author}")
+        await ctx.send(f"🔇 Muted {member.mention}. {('Duration: ' + duration) if duration else ''}")
+    except discord.Forbidden:
+        return await ctx.send("I don’t have permission to add the Muted role.")
+
+    # Timed mute
+    if duration:
+        try:
+            seconds = parse_duration_to_seconds(duration)
+            await schedule_unmute(ctx.guild.id, member.id, seconds)
+        except ValueError:
+            await ctx.send("Duration format invalid. Use like `10m`, `2h30m`, `3d`.")
+
+@bot.command(name="unmute")
+@commands.has_permissions(moderate_members=True, manage_roles=True)
+async def unmute(ctx: commands.Context, member: discord.Member):
+    if not await _ensure_guild(ctx):
+        return
+    role = discord.utils.get(ctx.guild.roles, name="Muted")
+    if not role or role not in member.roles:
+        return await ctx.send("That member is not muted.")
+    try:
+        await member.remove_roles(role, reason=f"Unmuted by {ctx.author}")
+        # cancel scheduled unmute if any
+        key = (ctx.guild.id, member.id)
+        task = scheduled_unmutes.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+        await ctx.send(f"🔈 Unmuted {member.mention}. {VICTORY}")
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to remove the Muted role.")
 
 # ---------- Error Handler ----------
 @bot.event
@@ -307,6 +634,9 @@ if TOKEN == "REPLACE_ME_WITH_ENV_VAR":
     raise SystemExit("Set DISCORD_TOKEN env var instead of hardcoding your token.")
 
 bot.run(TOKEN)
+
+
+
 
 
 
