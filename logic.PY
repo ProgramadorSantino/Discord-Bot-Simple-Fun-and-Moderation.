@@ -1,10 +1,20 @@
 # logic.py
 import random
 import re
+import string
+import secrets
 
 def gen_pass(pass_length: int) -> str:
-    elements = "+-/*!&$#?=@<>ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    return "".join(random.choice(elements) for _ in range(pass_length))
+    # Stronger: ensure at least one of each class; clamp to 8–64
+    pass_length = max(8, min(pass_length, 64))
+    pools = [string.ascii_lowercase, string.ascii_uppercase, string.digits, "+-/*!&$#?=@<>"]
+    # ensure one of each
+    base = [secrets.choice(p) for p in pools]
+    # fill the rest
+    allchars = "".join(pools)
+    base += [secrets.choice(allchars) for _ in range(pass_length - len(base))]
+    random.shuffle(base)
+    return "".join(base)
 
 def eight_ball() -> str:
     replies = [
