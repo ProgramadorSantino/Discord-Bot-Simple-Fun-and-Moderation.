@@ -12,7 +12,7 @@ from discord.ext import commands
 from discord.ext.commands import BadArgument
 from dotenv import load_dotenv
 
-import requests  # used for DUCK (wrapped in asyncio.to_thread)
+import aiohttp
 from logic import gen_pass, eight_ball, coin_flip, roll_dice
 
 # ---------- Logging ----------
@@ -185,19 +185,19 @@ def image_dynamic_cooldown(ctx: commands.Context) -> commands.Cooldown:
 # ---------- DUCK fetcher (non-blocking wrapper) ----------
 async def get_duck_image_url() -> str:
     """
-    Calls https://random-d.uk/api/random safely using requests in a thread.
+    Calls https://random-d.uk/api/random using aiohttp (async).
     Returns the image URL or empty string on failure.
     """
-    def _fetch():
-        try:
-            r = requests.get("https://random-d.uk/api/random", timeout=8)
-            r.raise_for_status()
-            data = r.json()
-            return data.get("url", "")
-        except Exception as e:
-            log.warning(f"[DUCK] fetch failed: {e}")
-            return ""
-    return await asyncio.to_thread(_fetch)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://random-d.uk/api/random", timeout=8) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                return data.get("url", "")
+    except Exception as e:
+        log.warning(f"[DUCK] fetch failed: {e}")
+        return ""
+
 
 # ---------- Events ----------
 @bot.event
