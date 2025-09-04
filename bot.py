@@ -4,6 +4,7 @@ import re
 import random
 import logging
 import asyncio
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -11,6 +12,7 @@ from discord.ext import commands
 from discord.ext.commands import BadArgument
 from dotenv import load_dotenv
 
+import requests  # used for DUCK (wrapped in asyncio.to_thread)
 from logic import gen_pass, eight_ball, coin_flip, roll_dice
 
 # ---------- Logging ----------
@@ -20,6 +22,7 @@ log = logging.getLogger("julian-bot")
 # ---------- Custom emojis ----------
 VICTORY = "<:VICTORY:1408236937424273529>"
 RUN = "<a:RUN:1408589572312535121>"
+
 # number emoji list for polls: supports up to 10 options
 NUM_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 
@@ -35,6 +38,29 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Put it in a .env file or your OS env vars.")
+
+# Directory for images (you can override with IMAGES_DIR env var)
+from pathlib import Path
+BASE_DIR = Path(__file__).parent.resolve()
+IMAGES_DIR = Path(os.getenv("IMAGES_DIR", BASE_DIR / "images")).resolve()
+VALID_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_image_cache: list[Path] = []
+
+def _refresh_image_cache() -> int:
+    global _image_cache
+    if not IMAGES_DIR.exists():
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    _image_cache = sorted([p for p in IMAGES_DIR.iterdir() if p.suffix.lower() in VALID_EXTS])
+    log.info(f"[MEME] Loaded {len(_image_cache)} image(s) from {IMAGES_DIR}")
+    return len(_image_cache)
+
+def _pick_images(k: int = 1) -> list[Path]:
+    if not _image_cache:
+        return []
+    k = max(1, min(k, 4))  # cap to 4 to avoid huge payloads
+    if len(_image_cache) >= k:
+        return random.sample(_image_cache, k=k)
+    return [random.choice(_image_cache) for _ in range(k)]
 
 # ---------- Intents ----------
 intents = discord.Intents.default()
@@ -105,7 +131,6 @@ async def ensure_muted_role(guild: discord.Guild) -> discord.Role:
         try:
             await channel.set_permissions(role, overwrite=overwrite)
         except Exception:
-            # Some channels may error (e.g., lack perms); skip quietly
             pass
     return role
 
@@ -114,7 +139,6 @@ async def schedule_unmute(guild_id: int, user_id: int, seconds: int, reason: str
     Background scheduler to unmute after N seconds.
     """
     key = (guild_id, user_id)
-    # cancel existing if any
     old = scheduled_unmutes.get(key)
     if old and not old.done():
         old.cancel()
@@ -142,23 +166,56 @@ async def schedule_unmute(guild_id: int, user_id: int, seconds: int, reason: str
     t = asyncio.create_task(_task())
     scheduled_unmutes[key] = t
 
+# ---------- Dynamic cooldown (mods bypass) ----------
+def _is_mod(ctx: commands.Context) -> bool:
+    # Admins or users with common mod perms bypass image cooldowns
+    perms = getattr(ctx.author, "guild_permissions", None)
+    if not perms:
+        return False
+    return perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
+
+def image_dynamic_cooldown(ctx: commands.Context) -> commands.Cooldown:
+    """
+    5s per-user cooldown for image commands; mods bypass (0s).
+    """
+    if _is_mod(ctx):
+        return commands.Cooldown(1, 0, commands.BucketType.user)  # no wait
+    return commands.Cooldown(1, 5, commands.BucketType.user)
+
+# ---------- DUCK fetcher (non-blocking wrapper) ----------
+async def get_duck_image_url() -> str:
+    """
+    Calls https://random-d.uk/api/random safely using requests in a thread.
+    Returns the image URL or empty string on failure.
+    """
+    def _fetch():
+        try:
+            r = requests.get("https://random-d.uk/api/random", timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("url", "")
+        except Exception as e:
+            log.warning(f"[DUCK] fetch failed: {e}")
+            return ""
+    return await asyncio.to_thread(_fetch)
+
 # ---------- Events ----------
 @bot.event
 async def on_ready():
     log.info(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
+    count = _refresh_image_cache()  # load or reload images at startup
+    log.info(f"📸 Meme image cache ready with {count} file(s) in {IMAGES_DIR}")
     activity = discord.Game(name="$help — now with ✨silliness✨")
     await bot.change_presence(activity=activity)
 
 @bot.event
 async def on_message(message: discord.Message):
-    # ignore our own messages
     if message.author == bot.user:
         return
 
     # --- DMs: friendly chat behavior ---
     if isinstance(message.channel, discord.DMChannel):
         text = message.content.strip().lower()
-
         if text.startswith(("hi", "hello", "hola")):
             await message.channel.send(f"👋 ¡Hola! I’m alive in DMs too. Try `$help` for commands. {VICTORY}")
         elif text.startswith("$pass"):
@@ -170,13 +227,11 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Let commands process for guild messages
     await bot.process_commands(message)
 
 # ---------- Help ----------
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
-    # Only show admin section if the author is an admin in a guild text channel
     is_admin = False
     if isinstance(ctx.channel, discord.TextChannel):
         is_admin = ctx.author.guild_permissions.administrator
@@ -198,6 +253,9 @@ async def _help(ctx: commands.Context):
         "• `poll \"Question\" opt1 | opt2 | ...` → reaction poll (up to 10)",
         "• `remindme <time> <message>` → DM reminder, e.g., `remindme 15m drink water`",
         "• `dadjoke` → so bad it’s good 😅",
+        "• `DUCK` → a random duck photo 🦆",
+        "• `MEME [count]` → random image(s) from /images (1–4)",
+        "• `memevs` → two random images to vote 1️⃣/2️⃣",
     ]
     if is_admin:
         lines += [
@@ -227,6 +285,10 @@ async def hello(ctx: commands.Context):
 @bot.command(name="FUCKYOU")
 async def insult(ctx: commands.Context):
     await ctx.send(f"No u {VICTORY} {RUN}")
+
+@bot.command(name="THEYTOOKMYFAMILY")
+async def kidnapping(ctx: commands.Context):
+    await ctx.send(f"HAHAHA NUB {RUN} {RUN}")
 
 @bot.command(name="bye")
 async def bye(ctx: commands.Context):
@@ -259,7 +321,6 @@ async def roll(ctx: commands.Context, dice: str = "1d6"):
 @bot.command(name="say")
 @commands.cooldown(2, 10, commands.BucketType.user)
 async def say(ctx: commands.Context, *, text: str):
-    # Stop mass pings
     text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
     flair = random.choice(["✨", "🌈", "🎉", "🦄", "🍭"])
     await ctx.send(f"{text} {flair}", allowed_mentions=discord.AllowedMentions.none())
@@ -267,6 +328,70 @@ async def say(ctx: commands.Context, *, text: str):
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     await ctx.send(f"Pong! {round(bot.latency*1000)} ms")
+
+# ---------- NEW: Image Commands (5s cooldown; mods bypass) ----------
+@bot.command(name="meme", aliases=["MEME"])
+@commands.dynamic_cooldown(image_dynamic_cooldown, commands.BucketType.user)
+async def meme(ctx: commands.Context, count: int = 1):
+    """
+    $MEME [count]
+    Sends 1–4 random images from the images folder. Case-insensitive.
+    """
+    if not _image_cache:
+        await ctx.send(f"No images found in `{IMAGES_DIR}`. Add files and try again.")
+        return
+    count = max(1, min(int(count), 4))
+    picks = _pick_images(count)
+    files = []
+    for p in picks:
+        try:
+            files.append(discord.File(fp=str(p), filename=p.name))
+        except Exception as e:
+            log.warning(f"[MEME] Could not attach {p}: {e}")
+    if not files:
+        return await ctx.send("Couldn’t attach any image files. Check permissions/paths.")
+    await ctx.send(content=f"Here you go {ctx.author.mention}! {VICTORY}", files=files)
+
+@bot.command(name="memevs")
+@commands.dynamic_cooldown(image_dynamic_cooldown, commands.BucketType.user)
+async def memevs(ctx: commands.Context):
+    """
+    $memevs
+    Sends two random images in one message so people can vote 1️⃣ or 2️⃣.
+    """
+    if not _image_cache:
+        await ctx.send(f"No images found in `{IMAGES_DIR}`. Add files and try again.")
+        return
+    picks = _pick_images(2)
+    files = []
+    for p in picks:
+        try:
+            files.append(discord.File(fp=str(p), filename=p.name))
+        except Exception as e:
+            log.warning(f"[MEME] Could not attach {p}: {e}")
+    if not files:
+        return await ctx.send("Couldn’t attach images. Check permissions/paths.")
+    msg = await ctx.send(content=f"**Meme Battle!** React to vote: 1️⃣ or 2️⃣ {VICTORY}", files=files)
+    try:
+        await msg.add_reaction("1️⃣")
+        await msg.add_reaction("2️⃣")
+    except Exception:
+        pass
+
+@bot.command(name="DUCK", aliases=["duck"])
+@commands.dynamic_cooldown(image_dynamic_cooldown, commands.BucketType.user)
+async def duck(ctx: commands.Context):
+    """
+    $DUCK  → Fetches a random duck image (🦆) from random-d.uk
+    Mods bypass cooldown; others 5s per-user.
+    """
+    url = await get_duck_image_url()
+    if not url:
+        return await ctx.send("Couldn’t fetch a duck right now. Try again in a moment.")
+    # send as embed (nicer than plain link)
+    embed = discord.Embed(title="🦆 Quack!", color=0x00ccff)
+    embed.set_image(url=url)
+    await ctx.send(embed=embed)
 
 # ---------- Member Utilities ----------
 @bot.command(name="avatar")
@@ -302,9 +427,6 @@ async def serverinfo(ctx: commands.Context):
 
 @bot.command(name="choose")
 async def choose(ctx: commands.Context, *, options: str):
-    """
-    Choose one from 'option1 | option2 | option3'
-    """
     parts = [p.strip() for p in options.split("|") if p.strip()]
     if len(parts) < 2:
         return await ctx.send("Give me at least two options, like: `$choose tacos | sushi | pizza`")
@@ -313,9 +435,6 @@ async def choose(ctx: commands.Context, *, options: str):
 
 @bot.command(name="poll")
 async def poll(ctx: commands.Context, *, text: str):
-    """
-    Usage: $poll "Your question?" opt1 | opt2 | opt3
-    """
     m = re.match(r'"\s*(.+?)\s*"\s*(.+)', text)
     if not m:
         return await ctx.send('Format: `$poll "Question" option1 | option2 | option3`')
@@ -323,7 +442,6 @@ async def poll(ctx: commands.Context, *, text: str):
     opts = [o.strip() for o in options.split("|") if o.strip()]
     if not (2 <= len(opts) <= 10):
         return await ctx.send("Give me between 2 and 10 options, separated by `|`.")
-    # build embed
     desc = "\n".join(f"{NUM_EMOJIS[i]}  {opt}" for i, opt in enumerate(opts))
     embed = discord.Embed(title=f"📊 {question}", description=desc, color=0x7289DA)
     embed.set_footer(text=f"Requested by {ctx.author}")
@@ -336,9 +454,6 @@ async def poll(ctx: commands.Context, *, text: str):
 
 @bot.command(name="remindme")
 async def remindme(ctx: commands.Context, time: str, *, message: str):
-    """
-    $remindme 10m drink water
-    """
     try:
         seconds = parse_duration_to_seconds(time)
     except ValueError:
@@ -469,7 +584,7 @@ async def joined(ctx: commands.Context, *, member: discord.Member):
         f"**Roles:** {role_line}"
     )
 
-# ---- New: Warnings system ----
+# ---- Warnings system ----
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
@@ -511,7 +626,7 @@ async def clearwarnings(ctx: commands.Context, member: discord.Member):
     warnings_store.pop(key, None)
     await ctx.send(f"🧽 Cleared **{count}** warnings for {member.mention}.")
 
-# ---- New: slowmode / lockdown / unlock / nickname / mute / unmute ----
+# ---- slowmode / lockdown / unlock / nickname / mute / unmute ----
 @bot.command(name="slowmode")
 @commands.has_permissions(manage_channels=True)
 async def slowmode(ctx: commands.Context, seconds: int):
@@ -581,7 +696,6 @@ async def mute(ctx: commands.Context, member: discord.Member, duration: str = No
     except discord.Forbidden:
         return await ctx.send("I don’t have permission to add the Muted role.")
 
-    # Timed mute
     if duration:
         try:
             seconds = parse_duration_to_seconds(duration)
@@ -599,7 +713,6 @@ async def unmute(ctx: commands.Context, member: discord.Member):
         return await ctx.send("That member is not muted.")
     try:
         await member.remove_roles(role, reason=f"Unmuted by {ctx.author}")
-        # cancel scheduled unmute if any
         key = (ctx.guild.id, member.id)
         task = scheduled_unmutes.pop(key, None)
         if task and not task.done():
@@ -611,7 +724,6 @@ async def unmute(ctx: commands.Context, member: discord.Member):
 # ---------- Error Handler ----------
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    # Let command-local handlers run first
     if hasattr(ctx.command, 'on_error'):
         return
 
