@@ -177,10 +177,12 @@ def _is_mod(ctx: commands.Context) -> bool:
 def image_dynamic_cooldown(ctx: commands.Context) -> commands.Cooldown:
     """
     5s per-user cooldown for image commands; mods bypass (0s).
+    NOTE: Do NOT pass BucketType here; the decorator supplies it.
     """
     if _is_mod(ctx):
-        return commands.Cooldown(1, 0, commands.BucketType.user)  # no wait
-    return commands.Cooldown(1, 5, commands.BucketType.user)
+        return commands.Cooldown(1, 0)   # no wait for mods
+    return commands.Cooldown(1, 5)       # 5s for everyone else
+
 
 # ---------- DUCK fetcher (non-blocking wrapper) ----------
 async def get_duck_image_url() -> str:
@@ -746,3 +748,5 @@ if TOKEN == "REPLACE_ME_WITH_ENV_VAR":
     raise SystemExit("Set DISCORD_TOKEN env var instead of hardcoding your token.")
 
 bot.run(TOKEN)
+
+
